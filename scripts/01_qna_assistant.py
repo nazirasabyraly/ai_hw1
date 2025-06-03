@@ -11,7 +11,7 @@ def load_assistant_id():
         return f.read().strip()
 
 def create_thread():
-    return client.threads.create()
+    return client.beta.threads.create()
 
 def check_answer_has_chunk_id(answer):
     # Look for patterns like "chunk 123" or "section ABC" in the answer
@@ -19,21 +19,21 @@ def check_answer_has_chunk_id(answer):
 
 def get_answer(thread, question):
     # Add the user's message to the thread
-    message = client.threads.messages.create(
+    message = client.beta.threads.messages.create(
         thread_id=thread.id,
         role="user",
         content=question
     )
     
     # Run the assistant
-    run = client.threads.runs.create(
+    run = client.beta.threads.runs.create(
         thread_id=thread.id,
         assistant_id=load_assistant_id()
     )
     
     # Wait for the response
     while True:
-        run_status = client.threads.runs.retrieve(
+        run_status = client.beta.threads.runs.retrieve(
             thread_id=thread.id,
             run_id=run.id
         )
@@ -44,8 +44,14 @@ def get_answer(thread, question):
         time.sleep(1)
     
     # Get the assistant's response
-    messages = client.threads.messages.list(thread_id=thread.id)
+    messages = client.beta.threads.messages.list(thread_id=thread.id)
     latest_response = messages.data[0].content[0].text.value
+    annotations = messages.data[0].content[0].text.annotations
+    if annotations:
+        print("\nCitations:")
+        for a in annotations:
+            print("-", a)
+
     
     # Validate that the answer references at least one chunk ID
     if not check_answer_has_chunk_id(latest_response):
