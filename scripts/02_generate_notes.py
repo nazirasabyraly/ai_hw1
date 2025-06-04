@@ -1,6 +1,9 @@
 import json
 import os
+import time
+import sys
 from typing import List
+from pathlib import Path
 from openai import OpenAI
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -13,48 +16,108 @@ class Note(BaseModel):
     heading: str = Field(..., example="Mean Value Theorem")
     summary: str = Field(..., max_length=150)
     page_ref: int | None = Field(None, description="Page number in source PDF")
-    
-def generate_notes() -> List[Note]:
-    with open("assistant_id.txt") as f:
-        assistant_id = f.read().strip()
 
-    # Создай thread и сразу запусти
-    run = client.beta.threads.create_and_run(
-        assistant_id=assistant_id,
-        thread={"messages": [
-            {
-                "role": "user",
-                "content": (
-                    "Please generate exactly 10 concise exam revision notes "
-                    "based on the uploaded PDF. "
-                    "Each note must include an id (1–10), a heading, a short summary "
-                    "(max 150 characters), and a page_ref if available. "
-                    "Respond only with valid JSON matching the Note[] schema."
-                )
-            }
-        ]},
-        response_format={"type": "json_object"}
+def wait_for_run(thread_id: str, run_id: str, timeout: int = 120):
+    """Wait for a run to complete with timeout and detailed status tracking"""
+    start_time = time.time()
+    last_status = None
+    
+    while time.time() - start_time < timeout:
+        run_status = client.beta.threads.runs.retrieve(
+            thread_id=thread_id,
+            run_id=run_id
+        )
+        
+        # Print status changes
+        if run_status.status != last_status:
+            if run_status.status == "queued":
+                print("\nQueued: Waiting to be processed...")
+            elif run_status.status == "in_progress":
+                print("\rProcessing: Reading through the documents...")
+            last_status = run_status.status
+        
+        if run_status.status == 'completed':
+            return run_status
+        elif run_status.status == 'failed':
+            error = getattr(run_status, 'last_error', None)
+            if error:
+                raise RuntimeError(f"Run failed: {error.code} - {error.message}")
+            raise RuntimeError("Run failed without specific error message")
+        elif run_status.status == 'expired':
+            raise RuntimeError("Run expired: Taking too long to process")
+        
+        time.sleep(1)
+    
+    raise RuntimeError(f"Timeout after {timeout} seconds")
+
+def generate_notes() -> List[Note]:
+    script_dir = Path(__file__).parent
+    
+    # Load assistant ID
+    try:
+        with open(script_dir / "assistant_id.txt") as f:
+            assistant_id = f.read().strip()
+    except FileNotFoundError:
+        raise RuntimeError("assistant_id.txt not found. Please run 00_bootstrap.py first.")
+
+    # Create a thread
+    thread = client.beta.threads.create()
+
+    # Add the instruction message
+    client.beta.threads.messages.create(
+        thread_id=thread.id,
+        role="user",
+        content=(
+            "Please generate exactly 10 concise exam revision notes "
+            "based on the uploaded PDF. Each note must include:\n"
+            "1. An ID number (1-10)\n"
+            "2. A clear heading\n"
+            "3. A concise summary (max 150 characters)\n"
+            "4. A page reference if available\n\n"
+            "Format your response as a JSON object with a 'notes' array containing "
+            "objects with 'id', 'heading', 'summary', and 'page_ref' fields."
+        )
     )
 
-    # Подожди завершения
-    import time
-    while True:
-        run_status = client.beta.threads.runs.retrieve(
-            thread_id=run.thread_id,
-            run_id=run.id
-        )
-        if run_status.status == "completed":
-            break
-        elif run_status.status == "failed":
-            raise RuntimeError("Run failed.")
-        time.sleep(1)
+    # Run the assistant
+    run = client.beta.threads.runs.create(
+        thread_id=thread.id,
+        assistant_id=assistant_id
+    )
 
-    # Получи сообщение
-    messages = client.beta.threads.messages.list(thread_id=run.thread_id)
-    content = messages.data[0].content[0].text.value
-    data = json.loads(content)
-    return [Note(**item) for item in data["notes"]]
-
+    try:
+        # Wait for completion
+        wait_for_run(thread.id, run.id)
+        
+        # Get the response
+        messages = client.beta.threads.messages.list(thread_id=thread.id)
+        if not messages.data:
+            raise RuntimeError("No response received from assistant")
+        
+        content = messages.data[0].content[0].text.value
+        
+        # Try to parse JSON response
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            # If direct parsing fails, try to extract JSON from the response
+            import re
+            json_match = re.search(r'\{[\s\S]*\}', content)
+            if json_match:
+                data = json.loads(json_match.group())
+            else:
+                raise RuntimeError("Could not extract valid JSON from response")
+        
+        if 'notes' not in data:
+            raise RuntimeError("Response missing 'notes' array")
+            
+        return [Note(**item) for item in data['notes']]
+        
+    except Exception as e:
+        print(f"\nError generating notes: {str(e)}")
+        print("\nRaw response content:")
+        print(content)
+        raise
 
 def print_pretty_notes(notes: List[Note]):
     # Print header
@@ -102,14 +165,20 @@ def save_notes_to_json(notes: List[Note], filename: str = "exam_notes.json"):
     print(f"\nNotes saved to {filename}")
 
 def main():
-    print("Generating study notes...")
-    notes = generate_notes()
-    
-    # Print the notes in a formatted way
-    print_pretty_notes(notes)
-    
-    # Save to JSON
-    save_notes_to_json(notes)
+    try:
+        print("Generating study notes...")
+        notes = generate_notes()
+        
+        # Print the notes in a formatted way
+        print_pretty_notes(notes)
+        
+        # Save to JSON
+        save_notes_to_json(notes)
+        
+    except Exception as e:
+        print(f"\nError: {str(e)}")
+        print("Please make sure you've run 00_bootstrap.py first and the PDF files are properly loaded.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
